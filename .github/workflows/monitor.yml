@@ -1,0 +1,79 @@
+name: Advanced Site Monitor
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # every 5 minutes
+  workflow_dispatch:
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    steps:
+      - name: Check Health Endpoint (status + latency + keyword)
+        id: check
+        run: |
+          URL="https://airocode.com/healthz"
+          KEYWORD='"ok":true'          # healthz json should contain this when OK
+          TIMEOUT="15"
+          SLOW_MS="6000"               # 6 seconds threshold for "slow"
+
+          # Curl: capture body + status + total time (seconds)
+          BODY=$(curl -sS --max-time $TIMEOUT -w "\n__HTTP_CODE:%{http_code}\n__TIME_TOTAL:%{time_total}\n" "$URL" || true)
+
+          HTTP_CODE=$(echo "$BODY" | sed -n 's/__HTTP_CODE:\(.*\)/\1/p' | tail -n 1)
+          TIME_TOTAL=$(echo "$BODY" | sed -n 's/__TIME_TOTAL:\(.*\)/\1/p' | tail -n 1)
+          CONTENT=$(echo "$BODY" | sed '/__HTTP_CODE:/,$d')
+
+          # Convert seconds -> ms (best effort)
+          TIME_MS=$(python3 - << 'PY'
+import os
+t=os.environ.get("TIME_TOTAL","0").strip()
+try:
+  print(int(float(t)*1000))
+except:
+  print(0)
+PY
+)
+          echo "http_code=$HTTP_CODE" >> $GITHUB_OUTPUT
+          echo "time_ms=$TIME_MS" >> $GITHUB_OUTPUT
+
+          # Determine result
+          RESULT="ok"
+          REASON="OK"
+
+          if [ -z "$HTTP_CODE" ]; then
+            RESULT="down"
+            REASON="No HTTP code (curl failed/timeout)"
+          elif [ "$HTTP_CODE" != "200" ]; then
+            RESULT="down"
+            REASON="HTTP $HTTP_CODE"
+          else
+            # keyword check (detect stuck/wrong page)
+            echo "$CONTENT" | grep -q "$KEYWORD" || (RESULT="degraded"; REASON="Keyword missing")
+          fi
+
+          # slow check (even if ok/degraded)
+          if [ "$TIME_MS" -gt "$SLOW_MS" ] && [ "$RESULT" = "ok" ]; then
+            RESULT="degraded"
+            REASON="Slow response ${TIME_MS}ms"
+          fi
+
+          echo "result=$RESULT" >> $GITHUB_OUTPUT
+          echo "reason=$REASON" >> $GITHUB_OUTPUT
+
+      - name: Send result to Laravel ingest endpoint
+        run: |
+          curl -sS -X POST "https://airocode.com/monitor/ingest" \
+            -H "Content-Type: application/json" \
+            -H "X-Monitor-Secret: ${{ secrets.MONITOR_SECRET }}" \
+            -d '{
+              "source":"github_actions",
+              "target":"airocode_healthz",
+              "url":"https://airocode.com/healthz",
+              "result":"${{ steps.check.outputs.result }}",
+              "http_code":"${{ steps.check.outputs.http_code }}",
+              "latency_ms":${{ steps.check.outputs.time_ms }},
+              "reason":"${{ steps.check.outputs.reason }}"
+            }'
